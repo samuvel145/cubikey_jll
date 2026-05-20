@@ -12,6 +12,9 @@ import random
 import re
 import time
 
+from audio_smoother import fade_in, fade_out                   # AUDIO-SMOOTH-v1
+from pronunciation_normalizer import normalize as tts_normalize # PRON-NORM-v1
+
 from pipecat.frames.frames import (
     AudioRawFrame,
     BotStartedSpeakingFrame,
@@ -633,6 +636,7 @@ class TextNormalizerProcessor(FrameProcessor):
             return self._to_words(m.group(1) or m.group(2))
         text = self._CURRENCY_RE.sub(_repl_currency, text)
         text = self._NUMBER_RE.sub(lambda m: self._to_words(m.group(1)), text)
+        text = tts_normalize(text)                             # PRON-NORM-v1
         return text
 
     async def _flush(self, direction: FrameDirection) -> None:
@@ -864,6 +868,65 @@ class TTSLogProcessor(FrameProcessor):
         elif isinstance(frame, TTSStoppedFrame):
             log_tts_complete()
         await self.push_frame(frame, direction)
+
+
+class AudioSmootherProcessor(FrameProcessor):  # AUDIO-SMOOTH-v1
+    """
+    Eliminates click/pop at TTS chunk boundaries with PCM16 fade-in/out.
+
+    Strategy — one-chunk-behind buffer:
+      TTSStartedFrame  → reset state
+      TTSAudioRawFrame → fade-in the first chunk; push the PREVIOUS pending
+                         chunk unmodified, hold the current one as pending
+      TTSStoppedFrame  → flush pending with fade-out applied, then pass frame
+
+    The buffer adds at most one audio chunk of latency (~20 ms) — inaudible.
+    Revert keyword: AUDIO-SMOOTH-v1
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._pending_frame: TTSAudioRawFrame | None = None
+        self._chunk_index: int = 0
+
+    async def process_frame(self, frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, TTSStartedFrame):
+            self._pending_frame = None
+            self._chunk_index = 0
+            await self.push_frame(frame, direction)
+
+        elif isinstance(frame, TTSAudioRawFrame):
+            audio = frame.audio
+            if self._chunk_index == 0:
+                audio = fade_in(audio)
+            # push the previous held frame, hold the current one
+            if self._pending_frame is not None:
+                await self.push_frame(self._pending_frame, direction)
+            try:
+                self._pending_frame = dataclasses.replace(frame, audio=audio)
+            except Exception:
+                self._pending_frame = frame  # fallback: push unmodified
+            self._chunk_index += 1
+
+        elif isinstance(frame, TTSStoppedFrame):
+            # flush pending with fade-out, then pass TTSStoppedFrame
+            if self._pending_frame is not None:
+                try:
+                    faded = dataclasses.replace(
+                        self._pending_frame,
+                        audio=fade_out(self._pending_frame.audio),
+                    )
+                except Exception:
+                    faded = self._pending_frame
+                await self.push_frame(faded, direction)
+                self._pending_frame = None
+            self._chunk_index = 0
+            await self.push_frame(frame, direction)
+
+        else:
+            await self.push_frame(frame, direction)
 
 
 class AudioInputLogProcessor(FrameProcessor):
@@ -1283,6 +1346,16 @@ def _is_immediate_callback(text: str) -> bool:
 # END CALLBACK-TAG-v1 ───────────────────────────────────────────────────────────
 
 
+# Words that follow "I am" / "I'm" that are NOT names — used in both _detect_intent
+# and _generate_acknowledgment to prevent "I am driving" → "Nice to meet you Driving"
+_NAME_EXCL = (
+    r"looking|searching|interested|here|calling|from|in|a\b|an\b|the\b"
+    r"|just|also|still|not|very|now|ready|driving|busy|going|working"
+    r"|talking|unable|sorry|sure|you|we|they|this|that|there|afraid"
+    r"|available|free|getting|coming|trying|using|checking|waiting"
+)
+
+
 class LatencyFillerProcessor(FrameProcessor):
     """
     Injects context-aware acknowledgments immediately after user speech ends to mask LLM latency.
@@ -1305,34 +1378,44 @@ class LatencyFillerProcessor(FrameProcessor):
         text_lower = text.lower()
 
         # Name giving — BEFORE confirmation so "Yeah, I'm Sam" / "I am Sam" → name not confirmation
-        # \bi\s+am\s+ only matches when NOT followed by an action/state word
+        # Negative lookahead (_NAME_EXCL) prevents "I am driving" → "Nice to meet you Driving"
+        # it's/that's patterns removed — too ambiguous ("it's correct" → spurious name match)
         if re.search(
-            r"\bi'?m\s+\w+"
-            r"|\bi\s+am\s+(?!looking|searching|interested|here|calling|from|in|a\b|an\b|the\b|just|also|still|not|very|now|ready)\w+"
-            r"|\bmy name\b|\bname is\b|\bthis is\b|\bcall me\b"
-            r"|\bit'?s\s+\w+|\bthat'?s\s+\w+",
+            rf"\bi'?m\s+(?!{_NAME_EXCL})\w+"
+            rf"|\bi\s+am\s+(?!{_NAME_EXCL})\w+"
+            r"|\bmy name\b|\bname is\b|\bcall me\b",
             text_lower,
         ):
             return "name_giving"
+
+        # Gratitude / farewell — check early so "thanks" doesn't fall to providing_info
+        _gratitude = {"thank", "thanks", "thank you", "thankyou", "cheers", "bye", "goodbye", "take care"}
+        if any(w in text_lower for w in _gratitude):
+            return "gratitude"
+
+        # Action request — BEFORE question so "can you connect/book..." fires correctly
+        if any(w in text_lower for w in ["book", "schedule", "call back", "callback", "send",
+                                          "whatsapp", "connect", "consultant", "transfer", "speak to"]):
+            return "action_request"
 
         # Question intent
         if any(w in text_lower for w in ["what", "how", "where", "which", "can you", "tell me", "show me"]):
             return "question"
 
         # Confirmation/affirmation — word-boundary check to prevent "ok" matching "looking"
+        # Skip to providing_info if the user is ALSO giving real information
+        # ("Yeah, Velachery", "Yes, 2 crore", "Okay, 3BHK") — those deserve specific ack phrases.
         _conf_words = {"yes", "yeah", "correct", "right", "exactly", "sure", "ok", "okay", "alright"}
         _word_set = set(re.sub(r"[.,!?']", " ", text_lower).split())
         if _word_set & _conf_words:
-            return "confirmation"
+            _entities = self._extract_entities(text)
+            if not any(_entities.values()):
+                return "confirmation"
+            # Entities present — fall through to providing_info for a specific ack phrase
 
         # Negation
         if any(w in text_lower for w in ["no", "not", "don't", "doesn't", "didn't"]):
             return "negation"
-
-        # Action request
-        if any(w in text_lower for w in ["book", "schedule", "call back", "callback", "send",
-                                          "whatsapp", "connect", "consultant", "transfer", "speak to"]):
-            return "action_request"
 
         # Correction
         if any(w in text_lower for w in ["actually", "change", "different", "instead", "rather"]):
@@ -1361,8 +1444,6 @@ class LatencyFillerProcessor(FrameProcessor):
             })
             if any(bare.endswith(s) for s in _PLACE_SUFFIXES) or bare in _SHORT_PLACES:
                 return "providing_info"
-            if len(bare) >= 2 and bare.isalpha():
-                return "name_giving"
 
         return "providing_info"
 
@@ -1404,6 +1485,12 @@ class LatencyFillerProcessor(FrameProcessor):
             entities["budget"] = "that"
         
         # Location/area — FILLER-CONTEXT-v1
+        # Abbreviations that .title() mangles — use exact display form
+        _AREA_DISPLAY_CASE: dict[str, str] = {
+            "omr": "OMR",
+            "ecr": "ECR",
+            "gst": "GST Road",
+        }
         areas = [
             "t nagar", "velachery", "omr", "ecr", "anna nagar", "porur", "adyar",
             "mylapore", "sholinganallur", "tambaram", "chromepet", "ambattur",
@@ -1415,7 +1502,7 @@ class LatencyFillerProcessor(FrameProcessor):
         ]
         for area in areas:
             if area in text_lower:
-                entities["area"] = area.title()
+                entities["area"] = _AREA_DISPLAY_CASE.get(area, area.title())
                 break
         # Bare single-word input that matches a place suffix → treat as area
         if "area" not in entities:
@@ -1443,23 +1530,22 @@ class LatencyFillerProcessor(FrameProcessor):
         # ── Name giving ───────────────────────────────────────────────────────
         if intent == "name_giving":
             name_match = re.search(
-                r"\bi'?m\s+(\w+)"
-                r"|\bi\s+am\s+(\w+)"
+                rf"\bi'?m\s+(?!{_NAME_EXCL})(\w+)"
+                rf"|\bi\s+am\s+(?!{_NAME_EXCL})(\w+)"
                 r"|\bmy name(?:\s+is)?\s+(\w+)"
                 r"|\bthis is\s+(\w+)"
                 r"|\bcall me\s+(\w+)"
-                r"|\bit'?s\s+(\w+)"
-                r"|\bthat'?s\s+(\w+)"
                 r"|\bname is\s+(\w+)",
                 text.lower(),
             )
             if name_match:
                 name = next(g for g in name_match.groups() if g).capitalize()
-                return random.choice([f"Hi {name}", f"Nice to meet you {name}"])
-            words = text.strip().split()
-            if len(words) == 1:
-                return f"Hi {words[0].strip('.,!?').capitalize()}"
+                return f"Nice to meet you {name}"
             return "Nice to meet you"
+
+        # ── Gratitude / farewell ─────────────────────────────────────────────
+        if intent == "gratitude":
+            return random.choice(["My pleasure", "Happy to help", "Glad I could help"])
 
         # ── Confirmation ──────────────────────────────────────────────────────
         if intent == "confirmation":

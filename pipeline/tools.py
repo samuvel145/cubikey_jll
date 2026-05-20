@@ -16,16 +16,16 @@ The 5 tools the LLM can call:
 
 import asyncio
 import json
-import logging
 import time
 from typing import Any
 
+from logger import get_logger
 from pipeline import jll_client
 
 # Full property-details cache TTL — 30 minutes per session
 _DETAILS_CACHE_TTL = 1800
 
-log = logging.getLogger("JLL-TOOLS")
+log = get_logger("tools")
 
 
 # ── Tool schemas (passed to Groq as function definitions) ─────────────────────

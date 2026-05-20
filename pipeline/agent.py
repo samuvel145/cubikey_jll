@@ -40,7 +40,7 @@ from config import settings
 from logger import get_logger, log_pipeline_event
 from pipeline import jll_client
 from pipeline.prompts import build_gather_hint, build_system_prompt
-from pipeline.processors import ConversationLogProcessor, EchoCancelGate, EchoCancelVADProcessor, FunctionCallFilter, LatencyFillerProcessor, PhoneticCorrectorProcessor, PostSpeechGate, STTLogProcessor, TextNormalizerProcessor, TTSLogProcessor, TTSSpeakingTracker, VADLogProcessor
+from pipeline.processors import AudioSmootherProcessor, ConversationLogProcessor, EchoCancelGate, EchoCancelVADProcessor, FunctionCallFilter, LatencyFillerProcessor, PhoneticCorrectorProcessor, PostSpeechGate, STTLogProcessor, TextNormalizerProcessor, TTSLogProcessor, TTSSpeakingTracker, VADLogProcessor  # AUDIO-SMOOTH-v1: AudioSmootherProcessor added
 from pipeline.tools import TOOL_SCHEMAS, JLLToolHandler
 
 log = get_logger("agent")
@@ -151,6 +151,7 @@ async def run_agent() -> None:
     tts_tracker        = TTSSpeakingTracker(gate=echo_gate, post_speech_gate=post_speech_gate)
     phonetic_corrector = PhoneticCorrectorProcessor(context=context)
     echo_vad           = EchoCancelVADProcessor(gate=echo_gate)
+    audio_smoother     = AudioSmootherProcessor()              # AUDIO-SMOOTH-v1
 
     pipeline = Pipeline(
         [
@@ -167,12 +168,13 @@ async def run_agent() -> None:
             llm,                             # 11. Azure OpenAI LLM
             func_filter,                     # 12. Drop function-call markup
             conv_log,                        # 13. LLM log + llm_first_token / llm_done stamps
-            text_normalizer,                 # 14. Number normalisation
+            text_normalizer,                 # 14. Number normalisation + pronunciation
             tts,                             # 15. Cartesia TTS
             tts_log,                         # 16. TTS first chunk stamp
-            transport.output(),              # 17. Speaker
-            tts_tracker,                     # 18. Echo gate control + latency report
-            context_aggregator.assistant(),  # 19. Store assistant turn
+            audio_smoother,                  # 17. PCM fade-in/out (AUDIO-SMOOTH-v1)
+            transport.output(),              # 18. Speaker
+            tts_tracker,                     # 19. Echo gate control + latency report
+            context_aggregator.assistant(),  # 20. Store assistant turn
         ]
     )
 
@@ -342,6 +344,7 @@ async def run_agent_ws(websocket, stream_sid: str = "") -> None:
     tts_tracker        = TTSSpeakingTracker(gate=echo_gate, post_speech_gate=post_speech_gate)
     phonetic_corrector = PhoneticCorrectorProcessor(context=context)
     echo_vad           = EchoCancelVADProcessor(gate=echo_gate)
+    audio_smoother     = AudioSmootherProcessor()              # AUDIO-SMOOTH-v1
 
     # ── Pipeline ──────────────────────────────────────────────────────────────
     pipeline = Pipeline(
@@ -360,12 +363,13 @@ async def run_agent_ws(websocket, stream_sid: str = "") -> None:
             llm,                             # 12. Azure OpenAI LLM
             func_filter,                     # 13. Drop function-call markup
             conv_log,                        # 14. LLM log
-            text_normalizer,                 # 15. Number normalisation
+            text_normalizer,                 # 15. Number normalisation + pronunciation
             tts,                             # 16. Cartesia TTS
             tts_log,                         # 17. TTS first chunk stamp
-            transport.output(),              # 18. WebSocket audio out
-            tts_tracker,                     # 19. Echo gate control + latency report
-            context_aggregator.assistant(),  # 20. Store assistant turn
+            audio_smoother,                  # 18. PCM fade-in/out (AUDIO-SMOOTH-v1)
+            transport.output(),              # 19. WebSocket audio out
+            tts_tracker,                     # 20. Echo gate control + latency report
+            context_aggregator.assistant(),  # 21. Store assistant turn
         ]
     )
 
