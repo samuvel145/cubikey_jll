@@ -348,14 +348,23 @@ async def run_agent_ws(websocket, stream_sid: str = "") -> None:
     conv_log           = ConversationLogProcessor()
     tts_log            = TTSLogProcessor()
     vad_log            = VADLogProcessor()
-    post_speech_gate   = PostSpeechGate(grace_secs=0.3)  # was 1.0 — too aggressive, dropped fast user replies
+    post_speech_gate   = PostSpeechGate(grace_secs=0.3)
     tts_tracker        = TTSSpeakingTracker(gate=echo_gate, post_speech_gate=post_speech_gate)
     phonetic_corrector = PhoneticCorrectorProcessor(context=context)
-    echo_vad           = EchoCancelVADProcessor(gate=echo_gate)
     audio_smoother     = AudioSmootherProcessor()              # AUDIO-SMOOTH-v1
     stt_gate_monitor   = STTAudioGateMonitor()
 
     # ── Pipeline ──────────────────────────────────────────────────────────────
+    # NOTE: EchoCancelVADProcessor is intentionally NOT present in the WS pipeline.
+    # On a phone call there is no acoustic loopback — user audio arrives over the
+    # WebSocket network, not from a local mic that could pick up the speaker.
+    # EchoCancelVADProcessor was closing the echo gate immediately on every VAD
+    # stop, cutting off the silence frames that Azure STT's PushAudioInputStream
+    # needs to finalise recognition.  Removing it lets Azure STT hear the natural
+    # post-speech silence and fire _on_handle_recognized reliably every turn.
+    # TTSSpeakingTracker still closes the gate the moment TTS starts playing
+    # (BotStartedSpeakingFrame), which is the only gate protection needed for
+    # phone calls.
     pipeline = Pipeline(
         [
             transport.input(),               # 1.  WebSocket audio in
@@ -367,19 +376,18 @@ async def run_agent_ws(websocket, stream_sid: str = "") -> None:
             stt_log,                         # 7.  STT log + stt_latency stamp
             latency_filler,                  # 8.  Inject filler words to mask latency
             post_speech_gate,                # 9.  Drop transcriptions within 0.3 s of bot stopping
-            echo_vad,                        # 10. Close echo gate on VAD stop, reopen on start
-            phonetic_corrector,              # 11. Phonetic correction for names + locations
-            context_aggregator.user(),       # 12. Accumulate user turn
-            llm,                             # 13. Azure OpenAI LLM
-            func_filter,                     # 14. Drop function-call markup
-            conv_log,                        # 15. LLM log
-            text_normalizer,                 # 16. Number normalisation + pronunciation
-            tts,                             # 17. Cartesia TTS
-            tts_log,                         # 18. TTS first chunk stamp
-            audio_smoother,                  # 19. PCM fade-in/out (AUDIO-SMOOTH-v1)
-            transport.output(),              # 20. WebSocket audio out
-            tts_tracker,                     # 21. Echo gate control + latency report
-            context_aggregator.assistant(),  # 22. Store assistant turn
+            phonetic_corrector,              # 10. Phonetic correction for names + locations
+            context_aggregator.user(),       # 11. Accumulate user turn
+            llm,                             # 12. Azure OpenAI LLM
+            func_filter,                     # 13. Drop function-call markup
+            conv_log,                        # 14. LLM log
+            text_normalizer,                 # 15. Number normalisation + pronunciation
+            tts,                             # 16. Cartesia TTS
+            tts_log,                         # 17. TTS first chunk stamp
+            audio_smoother,                  # 18. PCM fade-in/out (AUDIO-SMOOTH-v1)
+            transport.output(),              # 19. WebSocket audio out
+            tts_tracker,                     # 20. Echo gate control + latency report
+            context_aggregator.assistant(),  # 21. Store assistant turn
         ]
     )
 

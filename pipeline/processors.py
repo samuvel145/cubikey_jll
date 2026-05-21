@@ -979,6 +979,10 @@ class STTAudioGateMonitor(FrameProcessor):
     Counts AudioRawFrames that reach STT and logs the count when a VAD-stop
     event passes through.  If the count is 0 when VAD stops, the gate was
     closed the whole time and no audio reached STT — the agent will be silent.
+
+    Only watches VADUser* frames (directly from the VAD processor) — NOT the
+    secondary UserStartedSpeakingFrame / UserStoppedSpeakingFrame emitted by
+    LLMUserAggregator, which would produce false "0 frames" reports.
     """
 
     def __init__(self, **kwargs):
@@ -992,10 +996,10 @@ class STTAudioGateMonitor(FrameProcessor):
         if isinstance(frame, AudioRawFrame):
             self._frame_count += 1
             self._byte_count += len(frame.audio)
-        elif isinstance(frame, (VADUserStartedSpeakingFrame, UserStartedSpeakingFrame)):
+        elif isinstance(frame, VADUserStartedSpeakingFrame):
             self._frame_count = 0
             self._byte_count = 0
-        elif isinstance(frame, (VADUserStoppedSpeakingFrame, UserStoppedSpeakingFrame)):
+        elif isinstance(frame, VADUserStoppedSpeakingFrame):
             duration_ms = self._byte_count / (16000 * 2) * 1000  # 16kHz 16-bit mono
             if self._frame_count == 0:
                 self._stt_gate_log.warning(
