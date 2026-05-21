@@ -351,10 +351,16 @@ async def run_agent_ws(websocket, stream_sid: str = "") -> None:
     post_speech_gate   = PostSpeechGate(grace_secs=0.3)
     tts_tracker        = TTSSpeakingTracker(gate=echo_gate, post_speech_gate=post_speech_gate)
     phonetic_corrector = PhoneticCorrectorProcessor(context=context)
-    audio_smoother     = AudioSmootherProcessor()              # AUDIO-SMOOTH-v1
     stt_gate_monitor   = STTAudioGateMonitor()
 
     # ── Pipeline ──────────────────────────────────────────────────────────────
+    # NOTE: AudioSmootherProcessor is intentionally NOT present in the WS pipeline.
+    # For phone calls the audio goes through SOXR VHQ resampling (16kHz→8kHz) which
+    # already smooths PCM transitions.  Adding fade_in/fade_out on top creates
+    # amplitude discontinuities that interact with the phone codec frame clock,
+    # producing audible "tup tup" artefacts throughout TTS playback.
+    # AudioSmootherProcessor is kept only in the local audio pipeline (run_agent).
+    #
     # NOTE: EchoCancelVADProcessor is intentionally NOT present in the WS pipeline.
     # On a phone call there is no acoustic loopback — user audio arrives over the
     # WebSocket network, not from a local mic that could pick up the speaker.
@@ -387,10 +393,9 @@ async def run_agent_ws(websocket, stream_sid: str = "") -> None:
             text_normalizer,                 # 16. Number normalisation + pronunciation
             tts,                             # 17. Cartesia TTS
             tts_log,                         # 18. TTS first chunk stamp
-            audio_smoother,                  # 19. PCM fade-in/out (AUDIO-SMOOTH-v1)
-            transport.output(),              # 20. WebSocket audio out
-            tts_tracker,                     # 21. Echo gate control + latency report
-            context_aggregator.assistant(),  # 22. Store assistant turn
+            transport.output(),              # 19. WebSocket audio out
+            tts_tracker,                     # 20. Echo gate control + latency report
+            context_aggregator.assistant(),  # 21. Store assistant turn
         ]
     )
 
