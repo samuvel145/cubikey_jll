@@ -47,12 +47,20 @@ log = get_logger("agent")
 
 # Filler phrases spoken by TTS the moment a tool call fires,
 # so there is no silence while the API runs.
+#
+# IMPORTANT: these phrases must be clearly DIFFERENT from LatencyFillerProcessor
+# phrases.  LatencyFillerProcessor already plays a phrase like "Let me find plot
+# options for you" while the LLM processes.  If the tool filler says something
+# nearly identical ("Let me pull up those listings for you"), the user hears the
+# same idea twice in rapid succession — creating the perception of an echo/reverb.
+# Tool fillers should be short, distinct, and signal that a search/action is
+# actually running.
 _TOOL_FILLERS: dict[str, str] = {
-    "search_properties":   "Let me pull up those listings for you.",
-    "get_property_details": "Let me get the details on that.",
-    "areas_by_budget":     "Let me check which areas fit your budget.",
-    "submit_callback":     "Booking that callback for you now.",
-    "schedule_site_visit": "Scheduling your site visit now.",
+    "search_properties":   "Searching now.",
+    "get_property_details": "Pulling up the details.",
+    "areas_by_budget":     "Checking available areas.",
+    "submit_callback":     "Booking that for you now.",
+    "schedule_site_visit": "Scheduling your visit now.",
 }
 
 
@@ -111,7 +119,7 @@ async def run_agent() -> None:
         ),
     )
 
-    # ── TTS — Cartesia sonic-2 ────────────────────────────────────────
+    # ── TTS — Cartesia sonic-3 ────────────────────────────────────────
     log_pipeline_event("TTS", f"Initialising Cartesia voice_id={settings.CARTESIA_VOICE_ID[:8]}...")
     from pipecat.services.cartesia.tts import CartesiaTTSSettings
     tts = CartesiaTTSService(
@@ -119,7 +127,7 @@ async def run_agent() -> None:
         sample_rate=settings.SAMPLE_RATE,
         settings=CartesiaTTSSettings(
             voice=settings.CARTESIA_VOICE_ID,
-            model="sonic-2",
+            model="sonic-3",
         ),
     )
 
@@ -323,7 +331,7 @@ async def run_agent_ws(websocket, stream_sid: str = "") -> None:
         sample_rate=settings.SAMPLE_RATE,
         settings=CartesiaTTSSettings(
             voice=settings.CARTESIA_VOICE_ID,
-            model="sonic-2",
+            model="sonic-3",
         ),
     )
 
