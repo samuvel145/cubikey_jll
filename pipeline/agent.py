@@ -40,7 +40,7 @@ from config import settings
 from logger import get_logger, log_pipeline_event
 from pipeline import jll_client
 from pipeline.prompts import build_gather_hint, build_system_prompt
-from pipeline.processors import AudioSmootherProcessor, ConversationLogProcessor, EchoCancelGate, EchoCancelVADProcessor, FunctionCallFilter, LatencyFillerProcessor, PhoneticCorrectorProcessor, PostSpeechGate, STTLogProcessor, TextNormalizerProcessor, TTSLogProcessor, TTSSpeakingTracker, VADLogProcessor  # AUDIO-SMOOTH-v1: AudioSmootherProcessor added
+from pipeline.processors import AudioSmootherProcessor, ConversationLogProcessor, EchoCancelGate, EchoCancelVADProcessor, FunctionCallFilter, LatencyFillerProcessor, PhoneticCorrectorProcessor, PostSpeechGate, STTLogProcessor, TextNormalizerProcessor, TTSLogProcessor, TTSSpeakingTracker, VADLogProcessor, _TurnLatency  # AUDIO-SMOOTH-v1: AudioSmootherProcessor added
 from pipeline.tools import TOOL_SCHEMAS, JLLToolHandler
 
 log = get_logger("agent")
@@ -253,6 +253,10 @@ async def run_agent_ws(websocket, stream_sid: str = "") -> None:
     This is the same Exotel Media Streams format used by Vodafone India.
     ExotelFrameSerializer handles resampling between pipeline rate and 8 kHz.
     """
+    # Reset latency tracker so this session's opening greeting doesn't inherit
+    # vad_start from the previous session (which produced bogus 200s+ E2E numbers).
+    _TurnLatency.reset()
+
     log.info("[bold cyan]JLL Voice Agent (WebSocket) starting…[/bold cyan]")
     log_pipeline_event("INIT", "Building WebSocket pipeline components")
 
@@ -340,7 +344,7 @@ async def run_agent_ws(websocket, stream_sid: str = "") -> None:
     conv_log           = ConversationLogProcessor()
     tts_log            = TTSLogProcessor()
     vad_log            = VADLogProcessor()
-    post_speech_gate   = PostSpeechGate(grace_secs=1.0)
+    post_speech_gate   = PostSpeechGate(grace_secs=0.3)  # was 1.0 — too aggressive, dropped fast user replies
     tts_tracker        = TTSSpeakingTracker(gate=echo_gate, post_speech_gate=post_speech_gate)
     phonetic_corrector = PhoneticCorrectorProcessor(context=context)
     echo_vad           = EchoCancelVADProcessor(gate=echo_gate)

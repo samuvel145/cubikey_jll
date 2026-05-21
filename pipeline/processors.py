@@ -810,15 +810,25 @@ class STTLogProcessor(FrameProcessor):
 
     async def process_frame(self, frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-        if isinstance(frame, TranscriptionFrame) and frame.text.strip():
-            _TurnLatency.stamp("stt_done")
-            stt_ms = (_TurnLatency.stt_done - _TurnLatency.vad_start) * 1000 if _TurnLatency.vad_start else 0
-            _TurnState.turn_id += 1
-            _TurnState.transition("listening")
-            get_logger("agent").info("[TURN] id=%d", _TurnState.turn_id)
-            get_logger("agent").info(
-                "[STT]  final=%r  stt_latency=%.0fms", frame.text.strip(), stt_ms
-            )
+        if isinstance(frame, TranscriptionFrame):
+            text = frame.text.strip()
+            if text:
+                _TurnLatency.stamp("stt_done")
+                stt_ms = (_TurnLatency.stt_done - _TurnLatency.vad_start) * 1000 if _TurnLatency.vad_start else 0
+                _TurnState.turn_id += 1
+                _TurnState.transition("listening")
+                get_logger("agent").info("[TURN] id=%d", _TurnState.turn_id)
+                get_logger("agent").info(
+                    "[STT]  final=%r  stt_latency=%.0fms", text, stt_ms
+                )
+            else:
+                # Empty transcription = background noise / no speech detected by Azure STT.
+                # This is the most common cause of "agent goes silent" — VAD fires but
+                # STT finds nothing. Log it so it's visible in diagnostics.
+                get_logger("stt").warning(
+                    "[STT]  empty result (noise / too short / audio format issue) — "
+                    "agent will not respond to this turn"
+                )
         await self.push_frame(frame, direction)
 
 
