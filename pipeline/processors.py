@@ -1449,20 +1449,48 @@ _NAME_EXCL = (
 class LatencyFillerProcessor(FrameProcessor):
     """
     Injects context-aware acknowledgments immediately after user speech ends to mask LLM latency.
-    
+
     When a TranscriptionFrame arrives (user finished speaking), this processor:
     1. Analyzes user speech intent and content
     2. Generates a relevant acknowledgment phrase based on context
-    3. Immediately queues a TTSSpeakFrame with the acknowledgment
+    3. Immediately pushes a TTSSpeakFrame downstream (plays before LLM reply)
     4. Logs the acknowledgment being used
-    
-    This provides instant, context-aware audio feedback while the LLM processes in the background.
+
+    Pass context= (LLMContext) to enable context-aware name detection (single-word names
+    after "May I have your name" are correctly identified as name_giving).
     """
 
-    def __init__(self, task=None, **kwargs):
+    # Phrases in the last assistant message that indicate the bot was asking for a name
+    _AWAITING_NAME_TRIGGERS: tuple[str, ...] = (
+        'your name', 'may i have', 'name please', 'good name',
+        'who am i speaking', 'your good name', 'say your name',
+        "didn't catch", 'repeat your name', 'could you repeat',
+    )
+
+    def __init__(self, task=None, context=None, **kwargs):
         super().__init__(**kwargs)
         self._task = task
+        self._context = context
         self._filler_log = get_logger("filler")
+
+    def _last_assistant_text(self) -> str:
+        """Return the text of the most recent assistant message, or '' if unavailable."""
+        if not self._context:
+            return ""
+        for msg in reversed(self._context.messages):
+            if msg.get("role") == "assistant":
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    return " ".join(
+                        c.get("text", "") for c in content if isinstance(c, dict)
+                    )
+                return str(content)
+        return ""
+
+    def _awaiting_name(self) -> bool:
+        """True if the last assistant turn was asking for the caller's name."""
+        last = self._last_assistant_text().lower()
+        return any(t in last for t in self._AWAITING_NAME_TRIGGERS)
 
     def _detect_intent(self, text: str) -> str:  # FILLER-CONTEXT-v1
         text_lower = text.lower()
@@ -1561,15 +1589,16 @@ class LatencyFillerProcessor(FrameProcessor):
         if bhk_pattern:
             entities["bhk"] = bhk_pattern.group().upper()
         
-        # Budget — FILLER-CONTEXT-v1: detect word form AND numeric form
+        # Budget — detect word form AND numeric form.
+        # Use [\d,]+ so "10,000 lakhs" captures "10,000" (not just "000").
         if "crore" in text_lower:
-            crore_match = re.search(r'(\d+\.?\d*)\s*crore', text_lower)
+            crore_match = re.search(r'([\d,]+\.?\d*)\s*crore', text_lower)
             if crore_match:
-                entities["budget"] = f"{crore_match.group(1)} crore"
+                entities["budget"] = f"{crore_match.group(1).replace(',', '')} crore"
         elif "lakh" in text_lower or "lac" in text_lower:
-            lakh_match = re.search(r'(\d+)\s*(?:lakh|lac)', text_lower)
+            lakh_match = re.search(r'([\d,]+)\s*(?:lakh|lac)', text_lower)
             if lakh_match:
-                entities["budget"] = f"{lakh_match.group(1)} lakh"
+                entities["budget"] = f"{lakh_match.group(1).replace(',', '')} lakh"
         elif re.search(r'\d{1,3}(?:,\d{2,3}){2,}', text_lower):
             # Numeric Indian format: 2,00,00,000 or 50,00,000 etc.
             entities["budget"] = "that"
@@ -1617,12 +1646,31 @@ class LatencyFillerProcessor(FrameProcessor):
         budget = entities.get("budget", "")
         bhk   = entities.get("bhk", "")
 
+        # ── Context-aware single-word name override ──────────────────────────
+        # When the bot just asked for the caller's name and the response is 1–2
+        # words (e.g. "Sam", "Ravi Kumar"), treat the last content word as a name.
+        # This handles the case where STT returned "My name is." (cut off) and
+        # the name arrives as a standalone utterance on the NEXT turn.
+        if self._awaiting_name() and intent not in ("gratitude", "action_request"):
+            words_raw = [w.strip(".,!?") for w in text.split() if w.strip(".,!?")]
+            if len(words_raw) <= 2:
+                content_words = [w for w in words_raw if w.lower() not in _STOPWORDS]
+                if content_words:
+                    name_candidate = content_words[-1].capitalize()
+                    # Guard: don't treat property-type keywords as names
+                    _PROP_WORDS = frozenset({"apartment", "villa", "plot", "flat", "house", "bhk"})
+                    if name_candidate.lower() not in _PROP_WORDS:
+                        return f"Nice to meet you {name_candidate}"
+
         # ── Name giving ───────────────────────────────────────────────────────
         if intent == "name_giving":
+            # The lookahead (?!_FUNC_WORDS) prevents capturing stopwords/auxiliaries as names.
+            # "My name is." → optional-skip of "is" would capture "is" without the guard.
+            _FUNC_WORDS = r"(?:is|was|will|are|be|a|an|the|just|also|from)\b"
             name_match = re.search(
                 rf"\bi'?m\s+(?!{_NAME_EXCL})(\w+)"
                 rf"|\bi\s+am\s+(?!{_NAME_EXCL})(\w+)"
-                r"|\bmy name(?:\s+is)?\s+(\w+)"
+                rf"|\bmy name(?:\s+is)?\s+(?!{_FUNC_WORDS})(\w+)"
                 r"|\bthis is\s+(\w+)"
                 r"|\bcall me\s+(\w+)"
                 r"|\bname is\s+(\w+)",
@@ -1631,7 +1679,9 @@ class LatencyFillerProcessor(FrameProcessor):
             if name_match:
                 name = next(g for g in name_match.groups() if g).capitalize()
                 return f"Nice to meet you {name}"
-            return "Nice to meet you"
+            # No name word extracted (e.g. "My name is." — STT cut off before name).
+            # Return empty so the LLM can re-ask cleanly without a confusing nameless greeting.
+            return ""
 
         # ── Gratitude / farewell ─────────────────────────────────────────────
         if intent == "gratitude":
@@ -1678,6 +1728,10 @@ class LatencyFillerProcessor(FrameProcessor):
                 ])
             if bhk:
                 return f"Checking {bhk} options for you"
+            # Budget mentioned by keyword but amount not parseable (e.g. "my budget is 10,000")
+            text_lower = text.lower()
+            if any(w in text_lower for w in ("budget", "price range", "my range")):
+                return random.choice(["Noted", "Got it"])
             return random.choice(["Let me check that", "One moment"])
 
         # ── Question / generic ────────────────────────────────────────────────
@@ -1704,9 +1758,11 @@ class LatencyFillerProcessor(FrameProcessor):
 
                 acknowledgment = self._generate_acknowledgment(user_text)
                 acknowledgment = acknowledgment.rstrip('.')
-                self._filler_log.info("[FILLER] Acknowledgment: %r (user said: %r)", acknowledgment, user_text[:60])
-
-                ack_frame = TTSSpeakFrame(text=acknowledgment, append_to_context=False)
-                await self.push_frame(ack_frame, direction)
+                if acknowledgment:
+                    self._filler_log.info("[FILLER] Acknowledgment: %r (user said: %r)", acknowledgment, user_text[:60])
+                    ack_frame = TTSSpeakFrame(text=acknowledgment, append_to_context=False)
+                    await self.push_frame(ack_frame, direction)
+                else:
+                    self._filler_log.debug("[FILLER] No acknowledgment for: %r", user_text[:60])
 
         await self.push_frame(frame, direction)
