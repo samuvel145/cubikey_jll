@@ -43,8 +43,10 @@ class Settings(BaseSettings):
 
     # ── VAD ───────────────────────────────────────────────────
     VAD_AGGRESSIVENESS: int = 1  # latency fix: less aggressive, reduces missed speech
-    # How long (ms) of silence before VAD considers speech ended
-    SILENCE_THRESHOLD_MS: int = 300  # latency fix: halved from 600
+    # How long (ms) of silence before VAD considers speech ended.
+    # For phone/WebSocket calls use 500ms+ — too short (200-300ms) causes gate to close
+    # before Azure STT finalises, leading to empty transcription results.
+    SILENCE_THRESHOLD_MS: int = 500
 
     # ── LLM ───────────────────────────────────────────────────
     LLM_MODEL: str = "gpt-4o-mini"

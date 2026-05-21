@@ -808,9 +808,22 @@ class STTLogProcessor(FrameProcessor):
     TranscriptionFrame before the aggregator consumes it.
     """
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._interim_count: int = 0  # resets per turn
+
     async def process_frame(self, frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-        if isinstance(frame, TranscriptionFrame):
+
+        if isinstance(frame, InterimTranscriptionFrame):
+            # Interim results confirm Azure STT IS receiving intelligible audio.
+            # Absence of any interim before a final means audio was silence/noise/garbled.
+            self._interim_count += 1
+            get_logger("stt").debug(
+                "[STT]  interim #%d: %r", self._interim_count, (frame.text or "")[:60]
+            )
+
+        elif isinstance(frame, TranscriptionFrame):
             text = frame.text.strip()
             if text:
                 _TurnLatency.stamp("stt_done")
@@ -819,16 +832,20 @@ class STTLogProcessor(FrameProcessor):
                 _TurnState.transition("listening")
                 get_logger("agent").info("[TURN] id=%d", _TurnState.turn_id)
                 get_logger("agent").info(
-                    "[STT]  final=%r  stt_latency=%.0fms", text, stt_ms
+                    "[STT]  final=%r  stt_latency=%.0fms  interim_count=%d",
+                    text, stt_ms, self._interim_count,
                 )
             else:
-                # Empty transcription = background noise / no speech detected by Azure STT.
-                # This is the most common cause of "agent goes silent" — VAD fires but
-                # STT finds nothing. Log it so it's visible in diagnostics.
+                # Empty final transcription = background noise / too short / audio format issue.
+                # interim_count=0 here strongly suggests the audio reaching STT was silence
+                # or garbled (wrong format) — not recognisable as speech at all.
                 get_logger("stt").warning(
-                    "[STT]  empty result (noise / too short / audio format issue) — "
-                    "agent will not respond to this turn"
+                    "[STT]  empty final result  interim_count=%d  "
+                    "(0 = audio was silence/noise/garbled; >0 = speech cut off early)",
+                    self._interim_count,
                 )
+            self._interim_count = 0  # reset for next turn
+
         await self.push_frame(frame, direction)
 
 
@@ -952,6 +969,46 @@ class AudioInputLogProcessor(FrameProcessor):
             self._frame_count += 1
             if self._frame_count % 50 == 0:   # log every 50 frames (~1 sec)
                 audio_log.debug("🎙  %d audio frames captured", self._frame_count)
+        await self.push_frame(frame, direction)
+
+
+class STTAudioGateMonitor(FrameProcessor):
+    """
+    Placed between EchoCancelGate and AzureSTTService in the WS pipeline.
+
+    Counts AudioRawFrames that reach STT and logs the count when a VAD-stop
+    event passes through.  If the count is 0 when VAD stops, the gate was
+    closed the whole time and no audio reached STT — the agent will be silent.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._stt_gate_log = get_logger("stt")
+        self._frame_count: int = 0
+        self._byte_count: int = 0
+
+    async def process_frame(self, frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, AudioRawFrame):
+            self._frame_count += 1
+            self._byte_count += len(frame.audio)
+        elif isinstance(frame, (VADUserStartedSpeakingFrame, UserStartedSpeakingFrame)):
+            self._frame_count = 0
+            self._byte_count = 0
+        elif isinstance(frame, (VADUserStoppedSpeakingFrame, UserStoppedSpeakingFrame)):
+            duration_ms = self._byte_count / (16000 * 2) * 1000  # 16kHz 16-bit mono
+            if self._frame_count == 0:
+                self._stt_gate_log.warning(
+                    "[STT-GATE] 0 audio frames reached STT — echo gate was CLOSED "
+                    "during entire user turn. STT will return empty."
+                )
+            else:
+                self._stt_gate_log.info(
+                    "[STT-GATE] %d frames (%.0f ms of audio) passed to STT",
+                    self._frame_count, duration_ms,
+                )
+            self._frame_count = 0
+            self._byte_count = 0
         await self.push_frame(frame, direction)
 
 
