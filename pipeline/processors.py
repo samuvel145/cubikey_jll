@@ -1340,6 +1340,25 @@ class PhoneticCorrectorProcessor(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class GatherHintProcessor(FrameProcessor):
+    """
+    Placed between PhoneticCorrectorProcessor and context_aggregator.user().
+    On each non-empty TranscriptionFrame, calls update_fn() to refresh the
+    [GATHER STATE] system message so the LLM always knows what to ask next.
+    update_fn is a zero-argument callable supplied by agent.py.
+    """
+
+    def __init__(self, update_fn, **kwargs):
+        super().__init__(**kwargs)
+        self._update_fn = update_fn
+
+    async def process_frame(self, frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TranscriptionFrame) and frame.text.strip():
+            self._update_fn()
+        await self.push_frame(frame, direction)
+
+
 _conv_log = get_logger("agent")
 
 
@@ -1687,8 +1706,7 @@ class LatencyFillerProcessor(FrameProcessor):
                 acknowledgment = acknowledgment.rstrip('.')
                 self._filler_log.info("[FILLER] Acknowledgment: %r (user said: %r)", acknowledgment, user_text[:60])
 
-                if self._task:
-                    ack_frame = TTSSpeakFrame(text=acknowledgment, append_to_context=False)
-                    await self._task.queue_frame(ack_frame)
+                ack_frame = TTSSpeakFrame(text=acknowledgment, append_to_context=False)
+                await self.push_frame(ack_frame, direction)
 
         await self.push_frame(frame, direction)

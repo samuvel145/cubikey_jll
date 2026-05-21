@@ -50,11 +50,17 @@ def build_system_prompt(assistant_name: str) -> str:
 
 def build_gather_hint(gathered: dict) -> str:
     """
-    Return a short hint message appended to the system prompt
-    showing what has been collected so far.
-    Mirrors the GatherStateHint logic from bot__1_.py.
+    Return a short hint injected into the system prompt before each LLM call
+    showing what has been collected and what single question to ask next.
+
+    Question order matches the system prompt's mandatory sequence:
+      STEP 1 → property_type
+      STEP 2 → budget
+      STEP 3 → location (always Chennai; city is implicit)
+
+    City is omitted from next_question — this is a Chennai-only agent.
     """
-    city = gathered.get("city", "")
+    city = gathered.get("city", "Chennai")
     prop_type = gathered.get("property_type", "")
     location = gathered.get("location", "")
     min_price = gathered.get("min_price")
@@ -62,8 +68,6 @@ def build_gather_hint(gathered: dict) -> str:
     bedrooms = gathered.get("bedrooms", "")
 
     parts = []
-    if city:
-        parts.append(f"city={city}")
     if prop_type:
         parts.append(f"type={prop_type}")
     if location:
@@ -77,17 +81,17 @@ def build_gather_hint(gathered: dict) -> str:
 
     gathered_summary = ", ".join(parts) if parts else "nothing yet"
 
-    # Determine next question (mirrors _next_deterministic_gather_prompt in bot__1_.py)
-    if not city:
-        next_q = "Which city are you looking in — Chennai, Bengaluru, or Hyderabad?"
-    elif not prop_type:
-        next_q = "What kind of property are you looking for — apartment, villa, or plot?"
+    # STEP 1 — property type first, always
+    if not prop_type:
+        next_q = "What type of property are you looking at in Chennai — apartment, villa, or plot?"
+    # STEP 2 — budget second
     elif not (min_price or max_price):
-        next_q = "What is your budget range?"
+        next_q = "What's your budget range?"
+    # STEP 3 — location last, right before search
     elif not location:
-        next_q = f"Which area in {city} are you interested in?"
+        next_q = f"Which area in {city} are you looking at?"
     else:
-        next_q = "I have all the details. Searching now."
+        next_q = "All required fields are collected. Call search_properties immediately with no text."
 
     return GATHER_PHASE_PROMPT.format(
         gathered_summary=gathered_summary,

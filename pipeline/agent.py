@@ -40,7 +40,7 @@ from config import settings
 from logger import get_logger, log_pipeline_event
 from pipeline import jll_client
 from pipeline.prompts import build_gather_hint, build_system_prompt
-from pipeline.processors import AudioSmootherProcessor, ConversationLogProcessor, EchoCancelGate, EchoCancelVADProcessor, FunctionCallFilter, LatencyFillerProcessor, PhoneticCorrectorProcessor, PostSpeechGate, STTAudioGateMonitor, STTLogProcessor, TextNormalizerProcessor, TTSLogProcessor, TTSSpeakingTracker, VADLogProcessor, _TurnLatency  # AUDIO-SMOOTH-v1: AudioSmootherProcessor added
+from pipeline.processors import AudioSmootherProcessor, ConversationLogProcessor, EchoCancelGate, EchoCancelVADProcessor, FunctionCallFilter, GatherHintProcessor, LatencyFillerProcessor, PhoneticCorrectorProcessor, PostSpeechGate, STTAudioGateMonitor, STTLogProcessor, TextNormalizerProcessor, TTSLogProcessor, TTSSpeakingTracker, VADLogProcessor, _TurnLatency  # AUDIO-SMOOTH-v1: AudioSmootherProcessor added
 from pipeline.tools import TOOL_SCHEMAS, JLLToolHandler
 
 log = get_logger("agent")
@@ -160,21 +160,24 @@ async def run_agent() -> None:
             vad_log,                         # 3.  Reset latency clock on VAD speech start
             stt,                             # 4.  Azure STT → TranscriptionFrame
             stt_log,                         # 5.  STT log + stt_latency stamp
-            latency_filler,                  # 6.  Inject filler words to mask latency
+            latency_filler,                  # 6.  Push filler downstream (plays before LLM reply)
             post_speech_gate,                # 7.  Drop transcriptions within 1 s of bot stopping
             echo_vad,                        # 8.  Close echo gate on VAD stop, reopen on start
             phonetic_corrector,              # 9.  Phonetic correction for names + locations
-            context_aggregator.user(),       # 10. Accumulate user turn
-            llm,                             # 11. Azure OpenAI LLM
-            func_filter,                     # 12. Drop function-call markup
-            conv_log,                        # 13. LLM log + llm_first_token / llm_done stamps
-            text_normalizer,                 # 14. Number normalisation + pronunciation
-            tts,                             # 15. Cartesia TTS
-            tts_log,                         # 16. TTS first chunk stamp
-            audio_smoother,                  # 17. PCM fade-in/out (AUDIO-SMOOTH-v1)
-            transport.output(),              # 18. Speaker
-            tts_tracker,                     # 19. Echo gate control + latency report
-            context_aggregator.assistant(),  # 20. Store assistant turn
+            GatherHintProcessor(             # 10. Refresh [GATHER STATE] hint before LLM
+                update_fn=lambda: _update_gather_hint(context, tool_handler)
+            ),
+            context_aggregator.user(),       # 11. Accumulate user turn
+            llm,                             # 12. Azure OpenAI LLM
+            func_filter,                     # 13. Drop function-call markup
+            conv_log,                        # 14. LLM log + llm_first_token / llm_done stamps
+            text_normalizer,                 # 15. Number normalisation + pronunciation
+            tts,                             # 16. Cartesia TTS
+            tts_log,                         # 17. TTS first chunk stamp
+            audio_smoother,                  # 18. PCM fade-in/out (AUDIO-SMOOTH-v1)
+            transport.output(),              # 19. Speaker
+            tts_tracker,                     # 20. Echo gate control + latency report
+            context_aggregator.assistant(),  # 21. Store assistant turn
         ]
     )
 
@@ -182,9 +185,6 @@ async def run_agent() -> None:
         pipeline,
         params=PipelineParams(allow_interruptions=True),
     )
-
-    # Set task reference on latency_filler so it can queue frames
-    latency_filler._task = task
 
     # ── Tool call handlers ────────────────────────────────────────────────────
     # Queue a filler phrase the moment the tool fires so TTS plays while the
@@ -374,20 +374,23 @@ async def run_agent_ws(websocket, stream_sid: str = "") -> None:
             vad_log,                         # 5.  Reset latency clock on VAD speech start
             stt,                             # 6.  Azure STT → TranscriptionFrame
             stt_log,                         # 7.  STT log + stt_latency stamp
-            latency_filler,                  # 8.  Inject filler words to mask latency
+            latency_filler,                  # 8.  Push filler downstream (plays before LLM reply)
             post_speech_gate,                # 9.  Drop transcriptions within 0.3 s of bot stopping
             phonetic_corrector,              # 10. Phonetic correction for names + locations
-            context_aggregator.user(),       # 11. Accumulate user turn
-            llm,                             # 12. Azure OpenAI LLM
-            func_filter,                     # 13. Drop function-call markup
-            conv_log,                        # 14. LLM log
-            text_normalizer,                 # 15. Number normalisation + pronunciation
-            tts,                             # 16. Cartesia TTS
-            tts_log,                         # 17. TTS first chunk stamp
-            audio_smoother,                  # 18. PCM fade-in/out (AUDIO-SMOOTH-v1)
-            transport.output(),              # 19. WebSocket audio out
-            tts_tracker,                     # 20. Echo gate control + latency report
-            context_aggregator.assistant(),  # 21. Store assistant turn
+            GatherHintProcessor(             # 11. Refresh [GATHER STATE] hint before LLM
+                update_fn=lambda: _update_gather_hint(context, tool_handler)
+            ),
+            context_aggregator.user(),       # 12. Accumulate user turn
+            llm,                             # 13. Azure OpenAI LLM
+            func_filter,                     # 14. Drop function-call markup
+            conv_log,                        # 15. LLM log
+            text_normalizer,                 # 16. Number normalisation + pronunciation
+            tts,                             # 17. Cartesia TTS
+            tts_log,                         # 18. TTS first chunk stamp
+            audio_smoother,                  # 19. PCM fade-in/out (AUDIO-SMOOTH-v1)
+            transport.output(),              # 20. WebSocket audio out
+            tts_tracker,                     # 21. Echo gate control + latency report
+            context_aggregator.assistant(),  # 22. Store assistant turn
         ]
     )
 
@@ -395,9 +398,6 @@ async def run_agent_ws(websocket, stream_sid: str = "") -> None:
         pipeline,
         params=PipelineParams(allow_interruptions=True),
     )
-
-    # Set task reference on latency_filler so it can queue frames
-    latency_filler._task = task
 
     # ── Tool handlers ─────────────────────────────────────────────────────────
     def _make_tool_handler(tool_name: str):
