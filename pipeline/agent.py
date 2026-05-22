@@ -16,13 +16,11 @@ References:
 
 from __future__ import annotations
 
-import json
 import logging
 
-from pipecat.adapters.schemas.tools_schema import AdapterType, ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import StartFrame, TTSSpeakFrame
+from pipecat.frames.frames import StartFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -39,29 +37,11 @@ from pipecat.processors.audio.vad_processor import VADProcessor
 from config import settings
 from logger import get_logger, log_pipeline_event
 from pipeline import jll_client
-from pipeline.prompts import build_gather_hint, build_system_prompt
-from pipeline.processors import AudioSmootherProcessor, ConversationLogProcessor, EchoCancelGate, EchoCancelVADProcessor, FunctionCallFilter, GatherHintProcessor, LatencyFillerProcessor, PhoneticCorrectorProcessor, PostSpeechGate, STTAudioGateMonitor, STTLogProcessor, TextNormalizerProcessor, TTSLogProcessor, TTSSpeakingTracker, VADLogProcessor, _TurnLatency  # AUDIO-SMOOTH-v1: AudioSmootherProcessor added
-from pipeline.tools import TOOL_SCHEMAS, JLLToolHandler
+from pipeline.prompts import build_system_prompt
+# NO-API-FLOW-v1: removed GatherHintProcessor, TOOL_SCHEMAS, JLLToolHandler, build_gather_hint
+from pipeline.processors import AudioSmootherProcessor, ConversationLogProcessor, EchoCancelGate, EchoCancelVADProcessor, FunctionCallFilter, LatencyFillerProcessor, PhoneticCorrectorProcessor, PostSpeechGate, STTAudioGateMonitor, STTLogProcessor, TextNormalizerProcessor, TransferCallInterceptor, TTSLogProcessor, TTSSpeakingTracker, VADLogProcessor, _TurnLatency  # AUDIO-SMOOTH-v1: AudioSmootherProcessor added
 
 log = get_logger("agent")
-
-# Filler phrases spoken by TTS the moment a tool call fires,
-# so there is no silence while the API runs.
-#
-# IMPORTANT: these phrases must be clearly DIFFERENT from LatencyFillerProcessor
-# phrases.  LatencyFillerProcessor already plays a phrase like "Let me find plot
-# options for you" while the LLM processes.  If the tool filler says something
-# nearly identical ("Let me pull up those listings for you"), the user hears the
-# same idea twice in rapid succession — creating the perception of an echo/reverb.
-# Tool fillers should be short, distinct, and signal that a search/action is
-# actually running.
-_TOOL_FILLERS: dict[str, str] = {
-    "search_properties":   "Searching now.",
-    "get_property_details": "Pulling up the details.",
-    "areas_by_budget":     "Checking available areas.",
-    "submit_callback":     "Booking that for you now.",
-    "schedule_site_visit": "Scheduling your visit now.",
-}
 
 
 async def run_agent() -> None:
@@ -131,19 +111,12 @@ async def run_agent() -> None:
         ),
     )
 
-    # ── LLM Context (system prompt + tool schemas) ────────────────────────────
+    # ── LLM Context (system prompt, no tools — NO-API-FLOW-v1) ───────────────
     system_prompt = build_system_prompt(settings.JLL_ASSISTANT_NAME)
     context = LLMContext(
         messages=[{"role": "system", "content": system_prompt}],
-        tools=ToolsSchema(
-            standard_tools=[],
-            custom_tools={AdapterType.OPENAI: TOOL_SCHEMAS},
-        ),
     )
     context_aggregator = LLMContextAggregatorPair(context=context)
-
-    # ── Tool handler ──────────────────────────────────────────────────────────
-    tool_handler = JLLToolHandler()
 
     # ── Pipeline assembly ─────────────────────────────────────────────────────
     log_pipeline_event("PIPELINE", "Assembling pipeline stages")
@@ -160,6 +133,7 @@ async def run_agent() -> None:
     phonetic_corrector = PhoneticCorrectorProcessor(context=context)
     echo_vad           = EchoCancelVADProcessor(gate=echo_gate)
     audio_smoother     = AudioSmootherProcessor()              # AUDIO-SMOOTH-v1
+    transfer_intercept = TransferCallInterceptor()             # NO-API-FLOW-v1
 
     pipeline = Pipeline(
         [
@@ -172,13 +146,11 @@ async def run_agent() -> None:
             post_speech_gate,                # 7.  Drop transcriptions within 1 s of bot stopping
             echo_vad,                        # 8.  Close echo gate on VAD stop, reopen on start
             phonetic_corrector,              # 9.  Phonetic correction for names + locations
-            GatherHintProcessor(             # 10. Refresh [GATHER STATE] hint before LLM
-                update_fn=lambda: _update_gather_hint(context, tool_handler)
-            ),
-            context_aggregator.user(),       # 11. Accumulate user turn
-            llm,                             # 12. Azure OpenAI LLM
-            func_filter,                     # 13. Drop function-call markup
-            conv_log,                        # 14. LLM log + llm_first_token / llm_done stamps
+            context_aggregator.user(),       # 10. Accumulate user turn
+            llm,                             # 11. Azure OpenAI LLM
+            func_filter,                     # 12. Drop function-call markup
+            conv_log,                        # 13. LLM log + llm_first_token / llm_done stamps
+            transfer_intercept,              # 14. Strip TRANSFER_CALL_NOW from TTS (NO-API-FLOW-v1)
             text_normalizer,                 # 15. Number normalisation + pronunciation
             tts,                             # 16. Cartesia TTS
             tts_log,                         # 17. TTS first chunk stamp
@@ -193,33 +165,6 @@ async def run_agent() -> None:
         pipeline,
         params=PipelineParams(allow_interruptions=True),
     )
-
-    # ── Tool call handlers ────────────────────────────────────────────────────
-    # Queue a filler phrase the moment the tool fires so TTS plays while the
-    # API runs â€” eliminates the silence gap between LLM tool call and result.
-    def _make_tool_handler(tool_name: str):
-        async def _handler(params) -> None:
-            args = params.arguments
-            _update_gather_hint(context, tool_handler)
-            filler = _TOOL_FILLERS.get(tool_name)
-            if filler:
-                await task.queue_frame(TTSSpeakFrame(text=filler, append_to_context=False))
-            t0 = __import__("time").monotonic()
-            result_text = await tool_handler.handle(tool_name, args)
-            elapsed = __import__("time").monotonic() - t0
-            log.info(
-                "[TOOL] %-22s | %s | %.2fs",
-                tool_name,
-                json.dumps({k: v for k, v in args.items() if k in ("city", "location", "property_type", "min_price", "max_price")}, ensure_ascii=False),
-                elapsed,
-            )
-            log.info("[TOOL-RESULT] %s", result_text[:120])
-            await params.result_callback(result_text)
-        return _handler
-
-    for schema in TOOL_SCHEMAS:
-        func_name: str = schema["function"]["name"]
-        llm.register_function(func_name, _make_tool_handler(func_name))
 
     # ── Startup: let LLM speak the opening from system_prompt.txt ────────────
     @task.event_handler("on_pipeline_started")
@@ -335,17 +280,12 @@ async def run_agent_ws(websocket, stream_sid: str = "") -> None:
         ),
     )
 
-    # ── Context ───────────────────────────────────────────────────────────────
+    # ── Context (no tools — NO-API-FLOW-v1) ──────────────────────────────────
     system_prompt = build_system_prompt(settings.JLL_ASSISTANT_NAME)
     context = LLMContext(
         messages=[{"role": "system", "content": system_prompt}],
-        tools=ToolsSchema(
-            standard_tools=[],
-            custom_tools={AdapterType.OPENAI: TOOL_SCHEMAS},
-        ),
     )
     context_aggregator = LLMContextAggregatorPair(context=context)
-    tool_handler = JLLToolHandler()
 
     # ── Processors ────────────────────────────────────────────────────────────
     func_filter        = FunctionCallFilter()
@@ -360,6 +300,7 @@ async def run_agent_ws(websocket, stream_sid: str = "") -> None:
     tts_tracker        = TTSSpeakingTracker(gate=echo_gate, post_speech_gate=post_speech_gate)
     phonetic_corrector = PhoneticCorrectorProcessor(context=context)
     stt_gate_monitor   = STTAudioGateMonitor()
+    transfer_intercept = TransferCallInterceptor()             # NO-API-FLOW-v1
 
     # ── Pipeline ──────────────────────────────────────────────────────────────
     # NOTE: AudioSmootherProcessor is intentionally NOT present in the WS pipeline.
@@ -391,13 +332,11 @@ async def run_agent_ws(websocket, stream_sid: str = "") -> None:
             latency_filler,                  # 8.  Push filler downstream (plays before LLM reply)
             post_speech_gate,                # 9.  Drop transcriptions within 0.3 s of bot stopping
             phonetic_corrector,              # 10. Phonetic correction for names + locations
-            GatherHintProcessor(             # 11. Refresh [GATHER STATE] hint before LLM
-                update_fn=lambda: _update_gather_hint(context, tool_handler)
-            ),
-            context_aggregator.user(),       # 12. Accumulate user turn
-            llm,                             # 13. Azure OpenAI LLM
-            func_filter,                     # 14. Drop function-call markup
-            conv_log,                        # 15. LLM log
+            context_aggregator.user(),       # 11. Accumulate user turn
+            llm,                             # 12. Azure OpenAI LLM
+            func_filter,                     # 13. Drop function-call markup
+            conv_log,                        # 14. LLM log
+            transfer_intercept,              # 15. Strip TRANSFER_CALL_NOW from TTS (NO-API-FLOW-v1)
             text_normalizer,                 # 16. Number normalisation + pronunciation
             tts,                             # 17. Cartesia TTS
             tts_log,                         # 18. TTS first chunk stamp
@@ -421,31 +360,6 @@ async def run_agent_ws(websocket, stream_sid: str = "") -> None:
     async def _on_disconnect(_t, _ws):
         log.info("[WS] Client disconnected — cancelling pipeline immediately")
         await task.cancel()
-
-    # ── Tool handlers ─────────────────────────────────────────────────────────
-    def _make_tool_handler(tool_name: str):
-        async def _handler(params) -> None:
-            args = params.arguments
-            _update_gather_hint(context, tool_handler)
-            filler = _TOOL_FILLERS.get(tool_name)
-            if filler:
-                await task.queue_frame(TTSSpeakFrame(text=filler, append_to_context=False))
-            t0 = __import__("time").monotonic()
-            result_text = await tool_handler.handle(tool_name, args)
-            elapsed = __import__("time").monotonic() - t0
-            log.info(
-                "[TOOL] %-22s | %s | %.2fs",
-                tool_name,
-                json.dumps({k: v for k, v in args.items() if k in ("city", "location", "property_type", "min_price", "max_price")}, ensure_ascii=False),
-                elapsed,
-            )
-            log.info("[TOOL-RESULT] %s", result_text[:120])
-            await params.result_callback(result_text)
-        return _handler
-
-    for schema in TOOL_SCHEMAS:
-        func_name: str = schema["function"]["name"]
-        llm.register_function(func_name, _make_tool_handler(func_name))
 
     # ── Opening greeting ──────────────────────────────────────────────────────
     @task.event_handler("on_pipeline_started")
@@ -474,20 +388,3 @@ async def run_agent_ws(websocket, stream_sid: str = "") -> None:
         log.info("[WS] Agent session closed. stream_sid=%s", stream_sid)
 
 
-def _update_gather_hint(context: LLMContext, tool_handler: JLLToolHandler) -> None:
-    """
-    Inject a gather-state hint into the system message so the LLM always
-    knows what has been collected and what to ask next.
-    Mirrors GatherStateHint processor in bot (1).py.
-    """
-    hint = build_gather_hint(tool_handler.gathered)
-    messages = context.messages
-
-    # Replace existing gather hint system message if present
-    for i, msg in enumerate(messages):
-        if msg.get("role") == "system" and "[GATHER STATE]" in msg.get("content", ""):
-            messages[i] = {"role": "system", "content": f"[GATHER STATE]\n{hint}"}
-            return
-
-    # Insert after the main system prompt
-    messages.insert(1, {"role": "system", "content": f"[GATHER STATE]\n{hint}"})

@@ -1379,6 +1379,32 @@ class PhoneticCorrectorProcessor(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+# NO-API-FLOW-v1 ───────────────────────────────────────────────────────────────
+class TransferCallInterceptor(FrameProcessor):
+    """
+    Strips the TRANSFER_CALL_NOW token from LLM text output so TTS never says
+    it aloud.  Logs a prominent [TRANSFER] marker so the telephony layer can
+    detect that a call transfer should be triggered.
+
+    Revert keyword: NO-API-FLOW-v1
+    """
+
+    _TOKEN = "TRANSFER_CALL_NOW"
+
+    async def process_frame(self, frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, LLMTextFrame) and self._TOKEN in frame.text:
+            get_logger("agent").info(
+                "[TRANSFER] TRANSFER_CALL_NOW detected — connecting to property consultant"
+            )
+            cleaned = frame.text.replace(self._TOKEN, "").strip()
+            if cleaned:
+                await self.push_frame(LLMTextFrame(text=cleaned), direction)
+            return
+        await self.push_frame(frame, direction)
+# END NO-API-FLOW-v1 ────────────────────────────────────────────────────────────
+
+
 class GatherHintProcessor(FrameProcessor):
     """
     Placed between PhoneticCorrectorProcessor and context_aggregator.user().
