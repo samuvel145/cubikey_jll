@@ -40,11 +40,6 @@ def build_system_prompt(assistant_name: str) -> str:
     except KeyError:
         prompt = JLL_SYSTEM_PROMPT  # no placeholder — use as-is
 
-    # Tell the LLM how to handle the hidden startup trigger
-    prompt += (
-        "\n\nSTARTUP: When the user message is exactly '[BEGIN]', "
-        "deliver the OPENING message defined above. Do not mention '[BEGIN]' to the caller."
-    )
     return prompt
 
 

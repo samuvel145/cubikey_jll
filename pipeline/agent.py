@@ -20,7 +20,7 @@ import logging
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import StartFrame
+from pipecat.frames.frames import StartFrame, TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -42,6 +42,9 @@ from pipeline.prompts import build_system_prompt
 from pipeline.processors import AudioSmootherProcessor, ConversationLogProcessor, EchoCancelGate, EchoCancelVADProcessor, FunctionCallFilter, LatencyFillerProcessor, PhoneticCorrectorProcessor, PostSpeechGate, STTAudioGateMonitor, STTLogProcessor, TextNormalizerProcessor, TransferCallInterceptor, TTSLogProcessor, TTSSpeakingTracker, VADLogProcessor, _TurnLatency  # AUDIO-SMOOTH-v1: AudioSmootherProcessor added
 
 log = get_logger("agent")
+
+# Hardcoded opening greeting — bypasses LLM so it can never be modified.
+_OPENING_GREETING = "Thank you for calling JLL Homes. I'm Riya. How can I help you today?"
 
 
 async def run_agent() -> None:
@@ -166,17 +169,12 @@ async def run_agent() -> None:
         params=PipelineParams(allow_interruptions=True),
     )
 
-    # ── Startup: let LLM speak the opening from system_prompt.txt ────────────
+    # ── Startup: play hardcoded greeting (bypass LLM so it can never add name-ask)
     @task.event_handler("on_pipeline_started")
     async def _trigger_opening(t: PipelineTask, _frame: StartFrame) -> None:
-        log_pipeline_event("GREET", "Triggering opening from system_prompt.txt")
-        from pipecat.frames.frames import LLMMessagesAppendFrame
-        await t.queue_frame(
-            LLMMessagesAppendFrame(
-                messages=[{"role": "user", "content": "[BEGIN]"}],
-                run_llm=True,
-            )
-        )
+        log_pipeline_event("GREET", "Playing hardcoded opening greeting")
+        context.messages.append({"role": "assistant", "content": _OPENING_GREETING})
+        await t.queue_frame(TTSSpeakFrame(text=_OPENING_GREETING))
 
     # ── Runner ────────────────────────────────────────────────────────────────
     log_pipeline_event("READY", "Pipeline assembled — starting runner")
@@ -361,17 +359,12 @@ async def run_agent_ws(websocket, stream_sid: str = "") -> None:
         log.info("[WS] Client disconnected — cancelling pipeline immediately")
         await task.cancel()
 
-    # ── Opening greeting ──────────────────────────────────────────────────────
+    # ── Opening greeting — hardcoded, bypasses LLM entirely ──────────────────
     @task.event_handler("on_pipeline_started")
     async def _trigger_opening(t: PipelineTask, _frame: StartFrame) -> None:
-        log_pipeline_event("GREET", "Triggering opening from system_prompt.txt")
-        from pipecat.frames.frames import LLMMessagesAppendFrame
-        await t.queue_frame(
-            LLMMessagesAppendFrame(
-                messages=[{"role": "user", "content": "[BEGIN]"}],
-                run_llm=True,
-            )
-        )
+        log_pipeline_event("GREET", "Playing hardcoded opening greeting")
+        context.messages.append({"role": "assistant", "content": _OPENING_GREETING})
+        await t.queue_frame(TTSSpeakFrame(text=_OPENING_GREETING))
 
     # ── Runner ────────────────────────────────────────────────────────────────
     log_pipeline_event("READY", "WebSocket pipeline assembled — waiting for audio")
