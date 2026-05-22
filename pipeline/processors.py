@@ -1021,6 +1021,35 @@ class STTAudioGateMonitor(FrameProcessor):
 # Pure-Python, no external deps, ~microseconds per call — zero latency impact.
 # ─────────────────────────────────────────────────────────────────────────────
 
+_INDIAN_NUMBER_RE = re.compile(r'\b(\d{1,3}(?:,\d{2,3}){2,})\b')
+
+
+def _normalize_user_numbers(text: str) -> str:
+    """Convert Indian number format in user STT output to spoken words.
+
+    Handles numbers with 2+ comma-groups (e.g. 2,00,00,000 → "2 crore",
+    50,00,000 → "50 lakh") so the LLM can reliably parse budget values.
+    Single-comma numbers like 1,000 are left unchanged.
+    """
+    def _repl(m: re.Match) -> str:
+        raw = m.group(1).replace(',', '')
+        try:
+            n = int(raw)
+        except ValueError:
+            return m.group(1)
+        if n >= 10_000_000:
+            val = n / 10_000_000
+            return f"{int(val)} crore" if val == int(val) else f"{val:.1f} crore"
+        if n >= 100_000:
+            val = n / 100_000
+            return f"{int(val)} lakh" if val == int(val) else f"{val:.1f} lakh"
+        if n >= 1_000:
+            val = n / 1_000
+            return f"{int(val)} thousand" if val == int(val) else f"{val:.1f} thousand"
+        return raw
+    return _INDIAN_NUMBER_RE.sub(_repl, text)
+
+
 _SDEX: dict[str, str] = {
     'B': '1', 'F': '1', 'P': '1', 'V': '1',
     'C': '2', 'G': '2', 'J': '2', 'K': '2', 'Q': '2', 'S': '2', 'X': '2', 'Z': '2',
@@ -1322,6 +1351,16 @@ class PhoneticCorrectorProcessor(FrameProcessor):
     async def process_frame(self, frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if isinstance(frame, TranscriptionFrame) and frame.text.strip():
+            # Normalize Indian number formats before phonetic correction and LLM.
+            # "2,00,00,000" → "2 crore" so the LLM reliably parses budget values.
+            normalized_text = _normalize_user_numbers(frame.text)
+            if normalized_text != frame.text:
+                _phon_log.info("[PHONETIC] number normalize: %r → %r", frame.text, normalized_text)
+                try:
+                    frame = dataclasses.replace(frame, text=normalized_text)
+                except Exception:
+                    pass
+
             t0 = time.monotonic()
             awaiting_name, awaiting_location = self._detect_context()
             corrected = self._correct(frame.text, awaiting_name, awaiting_location)

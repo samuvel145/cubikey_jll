@@ -409,8 +409,18 @@ async def run_agent_ws(websocket, stream_sid: str = "") -> None:
 
     task = PipelineTask(
         pipeline,
-        params=PipelineParams(allow_interruptions=True),
+        params=PipelineParams(
+            allow_interruptions=True,
+            idle_timeout_secs=60,  # kill stalled/dead sessions in 60s (default ~5min)
+        ),
     )
+
+    # Cancel pipeline immediately when the phone hangs up so the process doesn't
+    # linger for the full idle_timeout_secs waiting for audio that will never arrive.
+    @transport.event_handler("on_client_disconnected")
+    async def _on_disconnect(_t, _ws):
+        log.info("[WS] Client disconnected — cancelling pipeline immediately")
+        await task.cancel()
 
     # ── Tool handlers ─────────────────────────────────────────────────────────
     def _make_tool_handler(tool_name: str):
