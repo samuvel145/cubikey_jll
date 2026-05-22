@@ -618,6 +618,8 @@ class TextNormalizerProcessor(FrameProcessor):
         return str(n)
 
     def _normalise(self, text: str) -> str:
+        # Safety: strip transfer sentinel that leaked past TransferCallInterceptor
+        text = text.replace("TRANSFER_CALL_NOW", "").strip()
         # Strip markdown formatting (LLM sometimes ignores the no-markdown instruction)
         text = re.sub(r"\*{1,2}([^*\n]+)\*{1,2}", r"\1", text)   # **bold** / *italic*
         text = re.sub(r"#{1,6}\s*", "", text)                      # ## heading markers
@@ -1383,24 +1385,61 @@ class PhoneticCorrectorProcessor(FrameProcessor):
 class TransferCallInterceptor(FrameProcessor):
     """
     Strips the TRANSFER_CALL_NOW token from LLM text output so TTS never says
-    it aloud.  Logs a prominent [TRANSFER] marker so the telephony layer can
-    detect that a call transfer should be triggered.
+    it aloud.  Uses a rolling buffer to catch the token even when the LLM
+    streams it as multiple sub-tokens (e.g. "TRANSFER", "_CALL", "_NOW").
+    Logs a prominent [TRANSFER] marker so the telephony layer can detect
+    that a call transfer should be triggered.
 
     Revert keyword: NO-API-FLOW-v1
     """
 
     _TOKEN = "TRANSFER_CALL_NOW"
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._buf: str = ""
+        self._log = get_logger("agent")
+
     async def process_frame(self, frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-        if isinstance(frame, LLMTextFrame) and self._TOKEN in frame.text:
-            get_logger("agent").info(
-                "[TRANSFER] TRANSFER_CALL_NOW detected — connecting to property consultant"
-            )
-            cleaned = frame.text.replace(self._TOKEN, "").strip()
-            if cleaned:
-                await self.push_frame(LLMTextFrame(text=cleaned), direction)
+
+        if isinstance(frame, LLMTextFrame) and frame.text:
+            self._buf += frame.text
+
+            # Full token present — strip it and emit whatever remains
+            if self._TOKEN in self._buf:
+                self._log.info(
+                    "[TRANSFER] TRANSFER_CALL_NOW detected — connecting to property consultant"
+                )
+                cleaned = self._buf.replace(self._TOKEN, "").strip()
+                self._buf = ""
+                if cleaned:
+                    await self.push_frame(LLMTextFrame(text=cleaned), direction)
+                return
+
+            # Partial prefix at end of buffer — hold it, emit the safe prefix
+            token = self._TOKEN
+            for i in range(min(len(self._buf), len(token)), 0, -1):
+                if self._buf.endswith(token[:i]):
+                    safe = self._buf[:-i]
+                    self._buf = self._buf[-i:]
+                    if safe:
+                        await self.push_frame(LLMTextFrame(text=safe), direction)
+                    return
+
+            # No partial match — emit buffer immediately
+            await self.push_frame(LLMTextFrame(text=self._buf), direction)
+            self._buf = ""
             return
+
+        if isinstance(frame, LLMFullResponseEndFrame):
+            if self._buf:
+                cleaned = self._buf.replace(self._TOKEN, "").strip()
+                if cleaned:
+                    self._log.debug("[TRANSFER] flushing held buffer: %r", cleaned)
+                    await self.push_frame(LLMTextFrame(text=cleaned), direction)
+                self._buf = ""
+
         await self.push_frame(frame, direction)
 # END NO-API-FLOW-v1 ────────────────────────────────────────────────────────────
 
@@ -1750,57 +1789,30 @@ class LatencyFillerProcessor(FrameProcessor):
 
         # ── Gratitude / farewell ─────────────────────────────────────────────
         if intent == "gratitude":
-            return random.choice(["My pleasure", "Happy to help", "Glad I could help"])
+            return random.choice(["Sure", "Absolutely", "Perfect"])
 
         # ── Confirmation ──────────────────────────────────────────────────────
         if intent == "confirmation":
-            if area or ptype or budget or bhk:
-                return random.choice(["Let me pull that up", "One moment"])
             return random.choice(["Sure", "Of course", "Noted"])
 
         # ── Negation ──────────────────────────────────────────────────────────
         if intent == "negation":
-            return random.choice(["Let me try different options", "Let me adjust that"])
+            return random.choice(["Noted", "Sure"])
 
         # ── Action request ────────────────────────────────────────────────────
         if intent == "action_request":
-            return random.choice(["Let me arrange that", "On it"])
+            return random.choice(["Sure", "Absolutely"])
 
         # ── Correction ────────────────────────────────────────────────────────
         if intent == "correction":
-            return random.choice(["Let me update that", "Noted"])
+            return random.choice(["Noted", "Sure"])
 
         # ── Providing info — context-aware ────────────────────────────────────
         if intent == "providing_info":
-            if area and ptype and bhk:
-                return f"Let me find {bhk} {ptype} options in {area}"
-            if area and ptype:
-                return f"Let me find {ptype} options in {area}"
-            if area and bhk:
-                return f"Checking {bhk} options in {area}"
-            if area:
-                return random.choice([
-                    f"Oh, you're looking in {area}",
-                    f"Got it, {area}",
-                ])
-            if ptype:
-                return f"Let me pull {ptype} options for you"
-            if budget:  # BUDGET-ACK-v1: all phrases use punctuation for Cartesia prosody + "your" not "that"
-                return random.choice([
-                    "Got it. Checking within your budget",
-                    "Sure. Searching within your budget",
-                    "Noted. Let me find options in your range",
-                ])
-            if bhk:
-                return f"Checking {bhk} options for you"
-            # Budget mentioned by keyword but amount not parseable (e.g. "my budget is 10,000")
-            text_lower = text.lower()
-            if any(w in text_lower for w in ("budget", "price range", "my range")):
-                return random.choice(["Noted", "Got it"])
-            return random.choice(["Let me check that", "One moment"])
+            return random.choice(["Sure", "Got it", "Noted", "Absolutely"])
 
         # ── Question / generic ────────────────────────────────────────────────
-        return random.choice(["Let me check that", "One moment"])
+        return random.choice(["Sure", "One moment"])
 
     async def process_frame(self, frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
